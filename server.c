@@ -17,7 +17,7 @@
 #include <utmp.h>
 
 
-#define PORT 3820
+#define PORT 3822
 #define MAX_CONNECTIONS 10
 #define BUFFER_SIZE 1024
 #define MAX_ARGS 10
@@ -63,9 +63,6 @@ void create_daemon() {
     dup2(fd, STDOUT_FILENO);     /* detach stdout */
     close (fd);
 
-    // Set the file permissions mask to 0
-    umask(0);
-
     /* Detach controlling terminal by becoming sesion leader */
     setsid();
 
@@ -78,9 +75,18 @@ void create_daemon() {
         exit(EXIT_FAILURE);
     }
 
+    // Set the file permissions mask to 0
+    umask(0);
+
     // Open a log file for output
     open("/tmp/yashd.log", O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
     syslog(LOG_NOTICE, "Daemon started successfully");
+
+    /* Make sure only one server is running */
+    if ( ( k = open("/tmp/yashd.log", O_RDWR | O_CREAT, 0666) ) < 0 )
+        exit(1);
+    if ( lockf(k, F_TLOCK, 0) != 0)
+        exit(0);
 }
 
 
@@ -112,37 +118,29 @@ void *handle_client(void *arg) {
         pthread_exit(NULL);
     }
 
-    // Create a pseudo-terminal (pty)
-    if (openpty(&master_fd, &slave_fd, NULL, NULL, NULL) == -1) {
-        syslog(LOG_ERR, "Failed to open pty");
-        close(client_socket);
-        pthread_exit(NULL);
-    }
+    int childpid;
 
-    // Fork the process to create a child
-    pid = fork();
+    // Fork the process and create a pseudo-terminal using forkpty()
+    pid = forkpty(&master_fd, NULL, NULL, NULL);
+    childpid = pid;
     if (pid < 0) {
-        syslog(LOG_ERR, "Fork failed");
+        syslog(LOG_ERR, "Forkpty failed");
         close(client_socket);
-        close(master_fd);
-        close(slave_fd);
         pthread_exit(NULL);
     }
 
-    if (pid == 0) {  // Child process: run the command or shell
-        close(master_fd);  // Close master FD in the child
-        dup2(slave_fd, STDIN_FILENO);  // Redirect stdin to slave FD
-        dup2(slave_fd, STDOUT_FILENO); // Redirect stdout to slave FD
-        dup2(slave_fd, STDERR_FILENO); // Redirect stderr to slave FD
-        close(slave_fd);  // No longer needed after dup2()
-        execl("/ysh", "ysh",  (char *)NULL);  // Run a shell
+    if (pid == 0) {  // Child process: run the shell or command
+        dup2(master_fd, STDIN_FILENO);
+        dup2(master_fd, STDOUT_FILENO);
+        dup2(master_fd, STDERR_FILENO);
+        setenv("TERM", "dumb", 1);  // Set the terminal type to dumb
+        execl("./ysh", "ysh", (char *)NULL);  // Replace with your shell program
         syslog(LOG_ERR, "Exec failed");
+        perror("Exec failed");
         exit(EXIT_FAILURE);
     }
 
-    close(slave_fd);  // Close slave FD in the parent
-
-    // Use select() to monitor both client_socket and master_fd
+    // Parent process: handle the interaction between client and the shell
     fd_set read_fds;
     int max_fd = (client_socket > master_fd) ? client_socket : master_fd;  // Max of both FDs
 
@@ -168,6 +166,18 @@ void *handle_client(void *arg) {
             }
             buffer[bytes_read] = '\0';
 
+            char *temp_cmd = buffer;  // Default to the original buffer
+
+            // Check if the buffer starts with "CMD " or "CAT "
+            if (strncmp(buffer, "CMD ", 4) == 0) {
+                temp_cmd = buffer + 4;  // Skip the "CMD " prefix
+            } else if (strncmp(buffer, "CAT ", 4) == 0) {
+                temp_cmd = buffer + 4;  // Skip the "CAT " prefix
+            }
+
+            // Remove the newline character at the end, if any
+            temp_cmd[strcspn(temp_cmd, "\n")] = '\0';
+
             // Log the command to /tmp/yashd.log
             time(&now);
             timeinfo = localtime(&now);
@@ -184,7 +194,7 @@ void *handle_client(void *arg) {
             }
 
             // Send the command to the child process (running the shell)
-            write(master_fd, buffer, bytes_read);
+            write(master_fd, temp_cmd, bytes_read-5);
         }
 
         // Check if there's data to read from the master FD (child process output)
@@ -193,6 +203,7 @@ void *handle_client(void *arg) {
             if (bytes_read > 0) {
                 buffer[bytes_read] = '\0';
                 send(client_socket, buffer, bytes_read, 0);
+                printf("Received from master_fd: '%s'\n", buffer);  // Debugging output
             }
         }
     }
@@ -230,7 +241,7 @@ void run_server() {
 
     // Bind the socket to the specified port
     server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(3820);
+    server_addr.sin_port = ntohs(htons(PORT));
     server_addr.sin_addr.s_addr = INADDR_ANY;  // Bind to any address
 
     if (bind(server_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
@@ -247,12 +258,14 @@ void run_server() {
     }
 
     syslog(LOG_INFO, "Server listening on port %d", PORT);
+    printf("Server listening on port");
 
     // Accept and handle incoming connections
     while (1) {
         client_socket = accept(server_socket, (struct sockaddr *)&client_addr, &client_addr_len);
         if (client_socket < 0) {
-            syslog(LOG_ERR, "Accept failed");
+            perror("Accept failed");
+            syslog(LOG_ERR, "Accept failed with error: %d", errno);
             continue;
         }
 
@@ -304,7 +317,7 @@ void run_server() {
 
 
 int main(){
-    create_daemon();
+    //create_daemon();
     run_server();  // Start the server
     return 0;
 }

@@ -8,7 +8,7 @@
 #include <fcntl.h>
 #include <errno.h>
 
-#define PORT 3820
+#define PORT 3822
 #define BUFFER_SIZE 1024
 
 int sockfd;
@@ -20,24 +20,24 @@ int server_connect(const char *ip_address) {
     // Create socket
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd < 0) {
-        perror("Socket creation failed");
+        printf("Socket creation failed");
         exit(EXIT_FAILURE);
     }
 
     // Set server address
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(PORT);
+    server_addr.sin_port = ntohs(htons(PORT));
 
     // Convert IP address
     if (inet_pton(AF_INET, ip_address, &server_addr.sin_addr) <= 0) {
-        perror("Invalid address or Address not supported");
+        printf("Invalid address or Address not supported");
         exit(EXIT_FAILURE);
     }
 
     // Connect to server
     if (connect(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        perror("Connection to server failed");
+        printf("Connection to server failed");
         exit(EXIT_FAILURE);
     }
 
@@ -73,19 +73,18 @@ void send_command(char *command) {
     send(sockfd, buffer, strlen(buffer), 0);
 }
 
+// Function to handle multiline input for commands like "cat" and "wc"
+void send_multiline_input() {
+    char buffer[BUFFER_SIZE] = {0};  // Initialize buffer
+    char input_line[BUFFER_SIZE];
 
-// Function to handle plain text input for commands like 'cat > file.txt'
-void send_plaintext_loop() {
-    char input[BUFFER_SIZE];
-
-    // Continue reading from stdin until EOF (Ctrl-D)
-    while (fgets(input, sizeof(input), stdin)) {
-        // Send the plain text to the server
-        send(sockfd, input, strlen(input), 0);
+    // Read multiline input until EOF (Ctrl-D)
+    while (fgets(input_line, sizeof(input_line), stdin) != NULL) {
+        strncat(buffer, input_line, sizeof(buffer) - strlen(buffer) - 1);
     }
 
-    // When the user sends EOF (Ctrl-D), send an EOF message to the server
-    send(sockfd, "EOF\n", 4, 0);  // Notify the server that the input is finished
+    // After receiving Ctrl-D (EOF), send the accumulated buffer to the server
+    send(sockfd, buffer, strlen(buffer), 0);
 }
 
 // Main client loop for reading commands and receiving responses
@@ -103,30 +102,40 @@ void client_loop() {
         }
 
         // Display the server's output, including the prompt
-        buffer[bytes_read] = '\0';  // Null-terminate the string
         printf("%s", buffer);  // Print the server's response
 
         // Read user input (command or text) and send it to the server
         if (fgets(command, sizeof(command), stdin) == NULL) {
-            // End of input (Ctrl-D)
-            handle_quit(0);  // Call a function to handle quitting
+            continue;
         }
 
-        // Remove the newline at the end of the input
-        command[strcspn(command, "\n")] = '\0';
+        // Remove newline at end if it exists
+        size_t len = strlen(command);
+        if (len > 0 && command[len - 1] == '\n') {
+            command[len - 1] = '\0';
+        }
 
         // Special case for quitting
         if (strcmp(command, "quit") == 0) {
             handle_quit(0);  // Call the quit handler
         }
 
-        // If the user enters a shell command (CMD), send it to the server
-        if (strncmp(command, "CMD ", 4) == 0) {
-            send_command(command + 4);  // Skip "CMD " and send only the command
-        } else if (strncmp(command, "CTL ", 4) == 0) {
-            // Handle control commands (CTL), for example, "CTL c", "CTL z"
-            send(sockfd, command, strlen(command), 0);  // Send control message to the server
+        // Tokenize the command to check the first part (the actual command)
+        char *first_token = strtok(command, " ");
+
+        // Check if the first part of the command is "cat" or "wc"
+        if (strcmp(first_token, "cat") == 0 || strcmp(first_token, "wc") == 0) {
+            // Send the "CMD cat" or "CMD wc" command to the server first
+            send_command(command);  // Send the full command
+
+            // Then read multiline input from the user and send to the server
+            send_multiline_input();
+        } else {
+            // For other commands, send them in CMD format
+            send_command(command);
         }
+
+
     }
 }
 
