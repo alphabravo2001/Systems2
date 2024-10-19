@@ -15,7 +15,12 @@
 #include <syslog.h>
 #include <util.h>
 #include <utmp.h>
+#include <termios.h>
+#include <sys/wait.h>
+#include <readline/readline.h>
+#include <readline/history.h>
 
+#include "ysh.h"
 
 #define PORT 3822
 #define MAX_CONNECTIONS 10
@@ -32,6 +37,7 @@ typedef struct {
     char client_ip[INET_ADDRSTRLEN];
     int client_port;
 } client_t;
+
 
 // Daemonize the process
 void create_daemon() {
@@ -130,6 +136,9 @@ void *handle_client(void *arg) {
     }
 
     if (pid == 0) {  // Child process: run the shell or command
+
+        //uncomment if you want to run execl insteaf of while loop below
+        /*
         dup2(master_fd, STDIN_FILENO);
         dup2(master_fd, STDOUT_FILENO);
         dup2(master_fd, STDERR_FILENO);
@@ -138,6 +147,148 @@ void *handle_client(void *arg) {
         syslog(LOG_ERR, "Exec failed");
         perror("Exec failed");
         exit(EXIT_FAILURE);
+         */
+
+
+        // beg of while loop
+        dup2(master_fd, STDIN_FILENO);
+        dup2(master_fd, STDOUT_FILENO);
+        dup2(master_fd, STDERR_FILENO);
+
+
+        int cpid;
+        char *inString;
+        char **parsedcmd;
+        int if_bg; //background
+
+        pid_t pgid = 0;
+        pid_t pipe_pids[MAX_PIDS]; //used in pipe for multiple PIDs
+
+        // Setup signal handlers
+        signal(SIGINT, sigint_handler);    // Handle Ctrl+C
+        signal(SIGTSTP, sigtstp_handler);  // Handle Ctrl+Z
+        signal(SIGCHLD, sigchld_handler);  // Handle child process cleanup
+
+        char *left_cmd = NULL, *right_cmd = NULL;
+
+        while ((inString = readline("# "))) {
+
+            if (current_command_line != NULL) {
+                free(current_command_line);
+            }
+            current_command_line = strdup(inString);
+
+            if_bg = 0;
+
+            if (strcmp(inString, "jobs") == 0) {
+                list_jobs();
+                free(inString);
+                continue;
+            }
+
+            if (strncmp(inString, "fg", 2) == 0) {
+                fg_command();
+                free(inString);
+                continue;
+            }
+
+            if (strncmp(inString, "bg", 2) == 0) {
+                bg_command();
+                free(inString);
+                continue;
+            }
+
+            if (strstr(inString, "&") != NULL) {
+                if_bg = 1;
+                inString[strcspn(inString, "&")] = '\0';  // Remove `&`
+            }
+
+            if (split_pipe(inString, &left_cmd, &right_cmd)) {
+                // If a pipe is found, split and handle the pipe
+                char **parsed_left_cmd = parse_command(left_cmd);
+                char **parsed_right_cmd = parse_command(right_cmd);
+
+                do_pipe(parsed_left_cmd, parsed_right_cmd);
+
+                if (if_bg) {
+                    // Add piped command as a background job using the first process's PGID
+                    add_job(pipe_pids[0], inString, RUNNING, 0);
+                } else {
+                    foreground_pid = cpid;
+                    //tcsetpgrp(STDIN_FILENO, getpid());  // Return control to the shell
+                    foreground_pid = -1;
+                }
+
+                free(parsed_left_cmd);
+                free(parsed_right_cmd);
+            }
+            else if ((strstr(inString, "<") != NULL) || (strstr(inString, ">") != NULL)){
+                parsedcmd = parse_command(inString);
+                cpid = fork();
+
+                if (cpid == 0) {
+                    setpgid(0, 0);  // Set PGID to the child's PID
+                    redirection(parsedcmd);
+                    execvp(parsedcmd[0], parsedcmd);
+                    perror("execvp failed");
+                    exit(EXIT_FAILURE);
+                } else {
+                    setpgid(cpid, cpid);  // Set the PGID of the child to its PID
+                    if (if_bg) {
+                        // If it's a background task, add to jobs list
+                        add_job(cpid, inString, RUNNING, 0);
+                    } else {
+                        // Foreground task
+                        foreground_pid = cpid;
+
+                        waitpid(cpid, NULL, 0);  // Wait for the foreground process to finish
+                        //tcsetpgrp(STDIN_FILENO, getpid());  // Return control to the shell
+                        foreground_pid = -1;
+                    }
+                }
+            }
+            else {
+                parsedcmd = parse_command(inString);  // Parse the command into arguments
+                cpid = fork();
+
+                if (cpid == 0) {
+                    setpgid(0, 0);  //set pgid to child's pid
+                    execvp(parsedcmd[0], parsedcmd);
+                    perror("execvp failed");
+                    exit(EXIT_FAILURE);
+                }
+                else if (cpid > 0) {  // Parent process
+                    setpgid(cpid, cpid);
+
+                    if (if_bg) {
+                        add_job(cpid, inString, RUNNING,0);  // Add the job to the jobs list
+                    } else {
+
+                        pid_t shell_pgrp = tcgetpgrp(STDIN_FILENO);
+                        if (shell_pgrp != getpid()) {
+                            printf("Shell is not in control of the terminal\n");
+                        }
+
+                        foreground_pid = cpid;
+                        //tcsetpgrp(STDIN_FILENO, cpid);
+
+                        int status;
+                        waitpid(cpid, &status, WUNTRACED); // Wait for the foreground job to finish
+                        //tcsetpgrp(STDIN_FILENO, getpid());  // Return control to the shell
+                        foreground_pid = -1;
+                    }
+                } else {
+                    perror("fork failed");
+                }
+
+                free(parsedcmd);
+            }
+
+            free(inString);
+        }
+
+        exit(EXIT_SUCCESS);
+        // end of while loop
     }
 
     // Parent process: handle the interaction between client and the shell
@@ -145,6 +296,7 @@ void *handle_client(void *arg) {
     int max_fd = (client_socket > master_fd) ? client_socket : master_fd;  // Max of both FDs
 
     while (1) {
+        memset(buffer, 0, sizeof(buffer));
         FD_ZERO(&read_fds);  // Clear the set of file descriptors
         FD_SET(client_socket, &read_fds);  // Add client socket to the set
         FD_SET(master_fd, &read_fds);  // Add master FD to the set
@@ -171,7 +323,7 @@ void *handle_client(void *arg) {
             // Check if the buffer starts with "CMD " or "CAT "
             if (strncmp(buffer, "CMD ", 4) == 0) {
                 temp_cmd = buffer + 4;  // Skip the "CMD " prefix
-            } else if (strncmp(buffer, "CAT ", 4) == 0) {
+            } else if (strncmp(buffer, "CTL ", 4) == 0) {
                 temp_cmd = buffer + 4;  // Skip the "CAT " prefix
             }
 
@@ -193,12 +345,16 @@ void *handle_client(void *arg) {
                 break;
             }
 
+            temp_cmd[strcspn(temp_cmd, "\n")] = '\0';
+            size_t len_to_write = strlen(temp_cmd);
+
             // Send the command to the child process (running the shell)
-            write(master_fd, temp_cmd, bytes_read-5);
+            write(master_fd, temp_cmd, len_to_write);
         }
 
         // Check if there's data to read from the master FD (child process output)
         if (FD_ISSET(master_fd, &read_fds)) {
+            memset(buffer, 0, sizeof(buffer));
             bytes_read = read(master_fd, buffer, sizeof(buffer) - 1);
             if (bytes_read > 0) {
                 buffer[bytes_read] = '\0';
@@ -258,7 +414,8 @@ void run_server() {
     }
 
     syslog(LOG_INFO, "Server listening on port %d", PORT);
-    printf("Server listening on port");
+    printf("Server listening on port %d", PORT);
+    fflush(stdout);
 
     // Accept and handle incoming connections
     while (1) {

@@ -78,7 +78,7 @@ void send_multiline_input() {
     char buffer[BUFFER_SIZE] = {0};  // Initialize buffer
     char input_line[BUFFER_SIZE];
 
-    // Read multiline input until EOF (Ctrl-D)
+    // Read multiline input until EOF
     while (fgets(input_line, sizeof(input_line), stdin) != NULL) {
         strncat(buffer, input_line, sizeof(buffer) - strlen(buffer) - 1);
     }
@@ -95,6 +95,7 @@ void client_loop() {
 
     while (1) {
         // Read server output (including prompt)
+        memset(buffer, 0, sizeof(buffer));
         bytes_read = recv(sockfd, buffer, sizeof(buffer) - 1, 0);
         if (bytes_read <= 0) {
             printf("Server disconnected or error occurred.\n");
@@ -134,7 +135,6 @@ void client_loop() {
             // For other commands, send them in CMD format
             send_command(command);
         }
-
 
     }
 }
